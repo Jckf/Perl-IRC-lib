@@ -1,59 +1,63 @@
 #!/usr/bin/perl
 
-# Load debug libs.
 use strict;
 use warnings;
 
-# Load more precise sleep().
-use Time::HiRes qw(sleep);
+use Time::HiRes 'sleep';
 
-# Load IRC lib.
+use Devel::SimpleTrace;
+
 use IRC;
 
-# Create our IRC object.
-my $irc = IRC->new(
-	'server'	=> 'irc.minecraft.no',
-	'username'	=> 'herp',
-	'realname'	=> 'Herp Derp',
-	'nickname'	=> 'Herp'
-);
+my $sleep_after = 10000;
 
-# Bind to the 001 numeric (001 means server registration is complete and that we can start joining channels).
-$irc->bind('001',sub {
-	# Join a channel.
-	$irc->join('#lounge');
+print 'Initializing...', "\n";
+
+my $irc = IRC->new();
+
+$irc->debug(1);
+
+$irc->bind('ping', sub {
+	my ($self, $data) = @_;
+
+	$self->pong(@{$data->{'arguments'}});
 });
 
-# Bind to the PRIVMSG command (someone talking).
-$irc->bind('privmsg',sub {
-	# Get the raw data.
-	my ($input) = @_;
+$irc->bind('001', sub {
+	my ($self) = @_;
 
-	# Split it up into something we can use.
-	my ($user,undef,$target,$message) = split(/\s:?/,substr($input,1),4);
-	my ($user_nick,$user_username,$user_address) = split(/[\!\@]/,$user,3);
-
-	# Check if this is a PM (target is ourself).
-	if ($target eq $irc->{'nickname'}) {
-		# It is. Set target to be the sender.
-		$target = $user_nick;
-	}
-
-	# Do something with the input here.
-	print $target . ' <' . $user_nick . '> ' . $message . "\n";
+	$self->join('#gamesdonequick');
 });
 
-# Loop while our IRC object exists.
-while ($irc) {
-	# Connect to the server.
-	$irc->connect();
+while (defined $irc) {
+	print 'Connecting...', "\n";
 
-	# Maintain the connection.
-	while ($irc->tick()) {
-		# Sleep for a little while so the bot won't go crazy.
-		sleep 0.01;
+	$irc->connect('irc.twitch.tv', 6667);
+
+	print 'Registering...', "\n";
+
+	$irc->cap('REQ', 'twitch.tv/commands twitch.tv/membership twitch.tv/tags');
+	$irc->pass('oauth:abc123abc123abc123abc123abc123abc123');
+	$irc->nick('Cheeky_Bot');
+
+	print 'Running...', "\n";
+
+	my $idle_counter = 0;
+	while (sleep 0.01) {
+		my $status = $irc->tick();
+
+		last unless $status;
+
+		$idle_counter = 0 if $status == 2;
+
+		if ($idle_counter < $sleep_after) {
+			$idle_counter++ if $status == 1;
+		} else {
+			sleep 0.25;
+		}
 	}
 
-	# We got disconnected. Sleep for 5 seconds before trying to reconnect.
+	print 'Disconnected. Waiting 5 seconds...', "\n";
+
 	sleep 5;
 }

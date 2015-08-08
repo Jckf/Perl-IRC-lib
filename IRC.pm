@@ -1,111 +1,179 @@
+#!/dev/null
+
 package IRC;
 
 use strict;
 use warnings;
-use Encode;
+
+use Devel::SimpleTrace;
+#use Data::Dumper;
+
+use Try::Tiny;
+
+use Scalar::Util 'reftype';
+
 use IO::Select;
 use IO::Socket::INET;
 
-use constant {
-	SELF => 0,
-	EVENT => 1,
-	SUB => 2,
-	ARGS => 2
-};
+use IRCv3;
 
 our $AUTOLOAD;
 
 sub new {
-	my ($class,%args) = @_;
+	my ($class, %args) = @_;
 
 	my $self = {
-		'server'	=> 'irc.fllabs.org',
-		'port'		=> 6667,
-		'username'	=> 'user',
-		'realname'	=> 'User',
-		'nickname'	=> 'User',
-		'handlers'	=> {}
+		'debug' => 0,
+		'handlers' => {},
+		'parser' => IRCv3->new(),
+		'select' => undef,
+		'socket' => undef,
+		'closed' => 1
 	};
 
 	$self->{$_} = $args{$_} for keys %args;
-	%{$self->{'args'}} = %args;
 
-	bless($self,$class)
+	bless($self, $class);
 }
 
-sub bind { $_[SELF]->{'handlers'}{uc $_[EVENT]} = $_[SUB]; }
+sub bind {
+	my ($self, $event, $handler) = @_;
 
-sub trigger { defined($_[SELF]->{'handlers'}{uc $_[EVENT]}) ? &{$_[SELF]->{'handlers'}{uc $_[EVENT]}}($_[ARGS]) : 0; }
+	$self->{'handlers'}->{uc $event} = () unless defined $self->{'handlers'}->{uc $event};
+
+	push(@{$self->{'handlers'}->{uc $event}}, $handler);
+}
+
+sub trigger {
+	my ($self, $event, $data) = @_;
+
+	return unless defined $self->{'handlers'}->{uc $event};
+
+	foreach my $handler (@{$self->{'handlers'}->{uc $event}}) {
+		try {
+			&{$handler}($self, $data);
+		} catch {
+			warn 'Error during event trigger: ' . $_;
+		}
+	}
+}
 
 sub connect {
+	my ($self, $server, $port) = @_;
+
+	return unless $self->{'closed'};
+
+	$self->{'socket'} = IO::Socket::INET->new(
+		'Proto' => 'tcp',
+		'PeerAddr' => $server,
+		'PeerPort' => $port
+	) or warn $!;
+
+	$self->{'closed'} = !defined $self->{'socket'};
+
+	return if $self->{'closed'};
+
+	$self->{'select'} = IO::Select->new($self->{'socket'});
+}
+
+sub disconnect {
 	my ($self) = @_;
 
-	$self->{'socket'} = IO::Socket::INET->new($self->{'server'} . ':' . $self->{'port'});
-	$self->{'select'} = IO::Select->new($self->{'socket'});
-
-	$self->user($self->{'username'},'*','*',$self->{'realname'});
-	$self->nick($self->{'nickname'});
-
-	return $self->{'socket'};
+	$self->{'socket'}->close();
+	$self->{'closed'} = 1;
 }
 
 sub write {
-	my ($self,@args) = @_;
+	my ($self, $data) = @_;
 
-	my @data;
-	push(@data,($_ =~ / / ? ':' : '') . $_) for (@args);
+	return if $self->{'closed'};
 
-	return syswrite($self->{'socket'},encode('utf8',join(' ',@data) . "\n"));
+	$data =~ s/[\r\n].*$//;
+
+	print '< ' . $data . "\n" if $self->{'debug'};
+
+	syswrite($self->{'socket'}, $data . "\r\n");
+}
+
+sub read {
+	my ($self) = @_;
+
+	return if $self->{'closed'};
+
+	return unless $self->{'select'}->can_read(0);
+
+	my ($data, $buffer, $line) = ('', '', 0);
+
+	if (defined $self->{'ibuffer'}) {
+		$data = $self->{'ibuffer'};
+		$self->{'ibuffer'} = undef;
+	}
+
+	while (sysread($self->{'socket'}, $buffer, 1)) {
+		$data .= $buffer;
+
+		if ($data =~ /[\r\n]+$/) {
+			$line = 1;
+			last;
+		}
+	}
+
+	return $self->disconnect() unless length $data;
+
+	unless ($line) {
+		$self->{'ibuffer'} = $buffer;
+		return;
+	}
+
+	$data =~ s/[\r\n]//g;
+
+	return unless length $data;
+
+	print '> ' . $data . "\n" if $self->{'debug'};
+
+	return $self->{'parser'}->decode($data);
 }
 
 sub tick {
 	my ($self) = @_;
 
-	if ($self->{'select'}->can_read(0)) {
-		my ($input,$buffer) = ('','');
-		while ($input !~ /\n$/) {
-			sysread($self->{'socket'},$buffer,1) or last;
-			last if !length $buffer;
-			$input .= $buffer;
-		}
-		$input =~ s/[\r\n]//g;
-		return 0 if !$input;
+	return 0 if $self->{'closed'} || $self->{'select'}->has_exception(0);
 
-		if (substr($input,0,1) ne ':') {
-			my @split = split(/ /,$input,2);
+	my $data = $self->read();
 
-			if ($split[0] eq 'PING') {
-				$self->pong($split[1]);
-			} elsif ($split[0] eq 'ERROR') {
-				return 0;
-			}
+	return 1 unless defined $data;
 
-			$self->trigger($split[0],$input);
-		} else {
-			my @split = split(/ /,$input,3);
+	$self->trigger($data->{'command'}, $data);
 
-			if ($split[1] eq '433') {
-				$self->nick($self->{'nickname'} . int(rand(10)));
-			} elsif ($split[1] eq 'NICK' && (split(/!/,substr($split[0],1),2))[0] eq $self->{'nickname'}) {
-				$self->{'nickname'} = $split[2];
-			}
+	return 2;
+}
 
-			$self->trigger($split[1],$input);
-		}
-	}
+sub debug {
+	my ($self, $state) = @_;
 
-	return 1;
+	$self->{'debug'} = $state;
 }
 
 sub AUTOLOAD {
-	my ($self,@args) = @_;
+	my ($self) = @_;
 
-	my $command = uc $AUTOLOAD;
-	$command =~ s/.*://;
+	my %data;
+	if (ref $_[1] eq 'HASH') {
+		%data = %{$_[1]};
+	} else {
+		shift; # Ugh.
+		$data{'arguments'} = \@_;
+	}
 
-	$self->write($command,@args);
+	$data{'command'} = substr(uc $AUTOLOAD, rindex($AUTOLOAD, ':') + 1);
+
+	$self->write($self->{'parser'}->encode(%data));
 }
 
-sub DESTROY { $_[0]->quit('IRC object destroyed.') }
+sub DESTROY {
+	my ($self) = @_;
+
+	$self->quit();
+}
 
 1;
